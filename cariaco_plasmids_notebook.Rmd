@@ -1,0 +1,1116 @@
+---
+title: "Cariaco plasmids"
+author: David Geller-McGrath
+date: June 1, 2023
+output:
+  html_document:
+    df_print: paged
+    toc: true # create a table of contents
+    toc_depth: 5 # up to five depths of headings in the toc
+    theme: united # select the document theme
+    syntax: tango # select syntax highlight theme
+---
+
+<br>
+
+This code was used for the analyses of Cariaco Basin plasmids detected within recovered metagenome-assembled genomes (MAGs) for the 2023 publication "_" by Paraskevi et al. Some sections of these analyses were done on a compute node of the Poseidon High Performance Computing (HPC) cluster based at the Woods Hole Oceanographic Institute (WHOI). All of the analyses done here using R can be run locally; HPC processing was used to speed up computations.
+
+<br>
+
+Load required R libraries
+
+```{r include=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(furrr)
+library(cowplot)
+```
+
+<br>
+
+## Process plasmid prediction results from PlasClass and PlasFlow - focusing on contigs containing biosynthetic gene clusters
+
+```{r message=FALSE, warning=FALSE}
+# parse in PlasClass predictions for plasmid contigs from MAGs --------
+
+plassclass_filepaths = system('ls rscripts/plasmid_prediction_analysis/plasclass_predictions/*', intern = TRUE)
+
+
+plasclass_predictions = plassclass_filepaths |>
+  map_dfr(~ read_tsv(.x, show_col_types = FALSE, col_names = FALSE))
+
+plasclass_predictions = plasclass_predictions |>
+  rename(contig = 1, probability = 2) |>
+  mutate(prediction = if_else(probability >= 0.85, '1', '0'))
+
+
+# parse in PlasFlow predictions for plasmid contigs from MAGs --------
+
+plasflow_filepaths = system('find rscripts/plasmid_prediction_analysis/plasflow_predictions -regex ".*.tsv$"', intern = TRUE)
+
+plasflow_predictions = plasflow_filepaths |>
+  map_dfr(~ read_tsv(.x, show_col_types = FALSE))
+
+
+plasflow_predictions = plasflow_predictions |>
+  select(3:6) |>
+  mutate(final_label = label |>
+           str_replace('(.*)\\..*', '\\1'),
+         prediction =
+           if_else(final_label == 'plasmid', '1', '0')) |>
+  relocate(c(prediction, final_label), .after = contig_length)
+
+plasflow_predictions = plasflow_predictions |>
+  rename(contig = contig_name)
+
+
+bgc_10kb_genes =
+  read_rds('~/Documents/cariaco-tidy-analysis/rdata-files/bgc_genes_10kb.rds')
+
+bgc_10kb_data = read_rds('~/Documents/cariaco-tidy-analysis/rdata-files/bnh_summary.rds')
+
+mag_table = read_rds('~/Documents/cariaco-tidy-analysis/rdata-files/mag_table.rds')
+
+bgc_plasmid_predictions_raw = bgc_10kb_data |>
+  left_join(plasflow_predictions |>
+              select(contig, prediction, final_label) |>
+              rename(plasflow_prediction = prediction,
+                     plasflow_label = final_label),
+            by = 'contig') |>
+  left_join(plasclass_predictions |>
+              select(contig, prediction) |>
+              rename(plasclass_prediction = prediction),
+            by = 'contig') |>
+  relocate(c(product, plasflow_prediction, plasclass_prediction,
+             plasflow_label), .after = contig)
+
+
+bgc_plasmid_predictions_final = bgc_plasmid_predictions_raw |>
+  filter(plasclass_prediction == '1' & plasflow_prediction == '1')
+
+
+bgc_plasmid_predictions_final = bgc_plasmid_predictions_final |>
+  mutate(mag_name = contig |>
+           str_replace('(MAG_\\d+)_.*', '\\1'),
+         .before = 1) |>
+  left_join(mag_table |>
+              select(mag_name, completeness, contamination,
+                     strain_het, domain, phylum, class, order,
+                     family, genus, species),
+            by = 'mag_name') |>
+  relocate(c(phylum, completeness, contamination), .after = product)
+
+#write_tsv(bgc_plasmid_predictions_final, file = '~/Downloads/cariaco_bgc_plasmid_data_final.tsv')
+```
+
+<br>
+
+## Process metagenomic and metatranscriptomic read mapping results for plasmid contigs
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+# on poseidon compute node
+# in dir: /vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna
+
+#set parallel processing params
+plan(multicore, workers = 30)
+options(future.globals.maxSize = 6081740800)
+
+
+# dna
+
+#normalized/unnormalized mapping results
+setwd('/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna')
+notCovFiles = system('find . -maxdepth 1 -name "*notCov*" ! -empty', intern = TRUE)
+notCovFiles = notCovFiles[!str_detect(notCovFiles, 'CLEANED')]
+
+#D2b143A is empty
+notCovFiles = notCovFiles[notCovFiles != './D2b143A_metaG_minimap2_all_contigs_mapping_notCov.tsv']
+
+metagenome_names = notCovFiles |>
+  str_replace('\\.\\/(.*)_metaG.*.tsv', '\\1')
+
+guay_rpkm = notCovFiles |>
+  set_names(metagenome_names) |>
+  imap(~ read_tsv(.x, show_col_types = FALSE) |>
+         select(1, 3, 4) |>
+         rename(!!.y := 2) |>
+         rename_with(~ paste0(.x, '_RPKM'), .cols = 2) |>
+         rename(!!.y := 3) |>
+         rename_with(~ paste0(.x, '_readCounts'), .cols = 3))
+
+guay_rpkm = guay_rpkm |>
+  reduce(left_join, by = 'Contig') |>
+  rename(contig = Contig)
+
+
+guayRpkmTwo = guay_rpkm |>
+  mutate(mag_name = contig |>
+           str_replace('(MAG_.*)_.*', '\\1'),
+         .before = 1) |>
+  filter(mag_name %in% c('MAG_18', 'MAG_245'))
+
+#write_tsv(guayRpkmTwo, file = '../rdata/guayRpkmTwo_dna.tsv')
+
+
+
+# rna
+
+#normalized/unnormalized mapping results
+setwd('/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna')
+notCovFiles = system('find . -maxdepth 1 -name "*notCov*" ! -empty', intern = TRUE)
+notCovFiles = notCovFiles[!str_detect(notCovFiles, 'CLEANED')]
+#D2b143A is empty
+notCovFiles = notCovFiles[notCovFiles != './_metaT_minimap2_all_contigs_mapping_notCov.tsv']
+
+metatranscriptome_names = notCovFiles |>
+  str_replace('\\.\\/(.*)_metaT.*.tsv', '\\1')
+
+guay_rpkm = notCovFiles |>
+  set_names(metatranscriptome_names) |>
+  imap(~ read_tsv(.x, show_col_types = FALSE) |>
+         select(1, 3, 4) |>
+         rename(!!.y := 2) |>
+         rename_with(~ paste0(.x, '_RPKM'), .cols = 2) |>
+         rename(!!.y := 3) |>
+         rename_with(~ paste0(.x, '_readCounts'), .cols = 3))
+
+guay_rpkm = guay_rpkm |>
+  reduce(left_join, by = 'Contig') |>
+  rename(contig = Contig)
+
+
+guayRpkmTwo = guay_rpkm |>
+  mutate(mag_name = contig |>
+           str_replace('(MAG_.*)_.*', '\\1'),
+         .before = 1) |>
+  filter(mag_name %in% c('MAG_18', 'MAG_245'))
+
+#write_tsv(guayRpkmTwo, file = '../rdata/guayRpkmTwo_rna.tsv')
+
+```
+
+
+<br>
+
+## summarize read mapping coverage of plasmids from metagenomic and metatranscriptomic samples
+
+```{r message=FALSE, warning=FALSE}
+
+rpkmDnaTwo = read_tsv('data_files/guayRpkmTwo_dna.tsv', show_col_types = FALSE)
+rpkmRnaTwo = read_tsv('data_files/guayRpkmTwo_rna.tsv', show_col_types = FALSE)
+
+
+### dna mapping
+
+mag18_dRpkm = rpkmDnaTwo |>
+  filter(mag_name == 'MAG_18') |>
+  mutate(contig = contig |>
+           str_replace('MAG_\\d+_(\\d+)', '\\1'),
+         contig = as.integer(contig),
+         contig_group = if_else(contig == 14, 'plasmid', 'genome')) |>
+  relocate(contig_group, .after = contig) |>
+  pivot_longer(
+    cols = matches('*_RPKM|*_readCounts'),
+    names_to = 'mapping_col',
+    values_to = 'value') |>
+  separate(mapping_col,
+           into = c('metagenome', 'mapping_col'),
+           sep = '_') |>
+  pivot_wider(
+    names_from = mapping_col,
+    values_from = value) |>
+  mutate(RPKM = if_else(readCounts > 15, RPKM, 0)) |>
+  select(-readCounts) |>
+  group_by(mag_name, contig_group, metagenome) |>
+  summarize(RPKM_mean = mean(RPKM),
+            RPKM_max = max(RPKM),
+            .groups = 'drop') |>
+  mutate(across(.cols = 4:5, ~ round(.x, digits = 5))) |>
+  unite(col = 'temp', c(RPKM_mean, RPKM_max), sep = ';') |>
+  pivot_wider(names_from = contig_group, values_from = temp) |>
+  separate(genome,
+           into = c('genome_RPKM_mean', 'genome_RPKM_max'),
+           sep = ';') |>
+  mutate(plasmid = plasmid |> str_replace('(.*);.*', '\\1')) |>
+  rename(plasmid_contig_RPKM = plasmid) |>
+  mutate(across(.cols = 3:5, ~ as.double(.x))) |>
+  arrange(desc(plasmid_contig_RPKM), desc(genome_RPKM_mean)) |>
+  relocate(c(genome_RPKM_max, genome_RPKM_mean, plasmid_contig_RPKM),
+           .after = metagenome)
+
+
+
+mag245_dRpkm = rpkmDnaTwo |>
+  filter(mag_name == 'MAG_245') |>
+  mutate(contig = contig |>
+           str_replace('MAG_\\d+_(\\d+)', '\\1'),
+         contig = as.integer(contig),
+         contig_group = if_else(contig == 32, 'plasmid', 'genome')) |>
+  relocate(contig_group, .after = contig) |>
+  pivot_longer(
+    cols = matches('*_RPKM|*_readCounts'),
+    names_to = 'mapping_col',
+    values_to = 'value') |>
+  separate(mapping_col,
+           into = c('metagenome', 'mapping_col'),
+           sep = '_') |>
+  pivot_wider(
+    names_from = mapping_col,
+    values_from = value) |>
+  mutate(RPKM = if_else(readCounts > 15, RPKM, 0)) |>
+  select(-readCounts) |>
+  group_by(mag_name, contig_group, metagenome) |>
+  summarize(RPKM_mean = mean(RPKM),
+            RPKM_max = max(RPKM),
+            .groups = 'drop') |>
+  mutate(across(.cols = 4:5, ~ round(.x, digits = 5))) |>
+  unite(col = 'temp', c(RPKM_mean, RPKM_max), sep = ';') |>
+  pivot_wider(names_from = contig_group, values_from = temp) |>
+  separate(genome,
+           into = c('genome_RPKM_mean', 'genome_RPKM_max'),
+           sep = ';') |>
+  mutate(plasmid = plasmid |> str_replace('(.*);.*', '\\1')) |>
+  rename(plasmid_contig_RPKM = plasmid) |>
+  mutate(across(.cols = 3:5, ~ as.double(.x))) |>
+  arrange(desc(plasmid_contig_RPKM), desc(genome_RPKM_mean)) |>
+  relocate(c(genome_RPKM_max, genome_RPKM_mean, plasmid_contig_RPKM),
+           .after = metagenome)
+
+
+
+
+### rna mapping
+
+
+# find contigs containing ribosomal proteins and mask them from downstream RNA analysis
+prokka_annos = readRDS('rdata_files/prokka_annos.rds')
+
+twoMagsProkkaAnnos = prokka_annos |>
+  filter(mag_name %in% c('MAG_18', 'MAG_245'))
+
+rm(prokka_annos)
+
+contigsToMask = twoMagsProkkaAnnos |>
+  filter(str_detect(product, regex('ribosomal protein|ribosomal rna|16S', ignore_case = TRUE))) |>
+  pull(contig) |>
+  unique()
+
+
+
+mag18_rRpkm = rpkmRnaTwo |>
+  filter(mag_name == 'MAG_18',
+         !contig %in% contigsToMask) |>
+  mutate(contig = contig |>
+           str_replace('MAG_\\d+_(\\d+)', '\\1'),
+         contig = as.integer(contig),
+         contig_group = if_else(contig == 14, 'plasmid', 'genome')) |>
+  relocate(contig_group, .after = contig) |>
+  pivot_longer(
+    cols = matches('*_RPKM|*_readCounts'),
+    names_to = 'mapping_col',
+    values_to = 'value') |>
+  separate(mapping_col,
+           into = c('metatranscriptome', 'mapping_col'),
+           sep = '_') |>
+  pivot_wider(
+    names_from = mapping_col,
+    values_from = value) |>
+  mutate(RPKM = if_else(readCounts > 15, RPKM, 0)) |>
+  select(-readCounts) |>
+  group_by(mag_name, contig_group, metatranscriptome) |>
+  summarize(RPKM_mean = mean(RPKM),
+            RPKM_max = max(RPKM),
+            .groups = 'drop') |>
+  mutate(across(.cols = 4:5, ~ round(.x, digits = 5))) |>
+  unite(col = 'temp', c(RPKM_mean, RPKM_max), sep = ';') |>
+  pivot_wider(names_from = contig_group, values_from = temp) |>
+  separate(genome,
+           into = c('genome_RPKM_mean', 'genome_RPKM_max'),
+           sep = ';') |>
+  mutate(plasmid = plasmid |> str_replace('(.*);.*', '\\1')) |>
+  rename(plasmid_contig_RPKM = plasmid) |>
+  mutate(across(.cols = 3:5, ~ as.double(.x))) |>
+  arrange(desc(plasmid_contig_RPKM), desc(genome_RPKM_mean)) |>
+  relocate(c(genome_RPKM_max, genome_RPKM_mean, plasmid_contig_RPKM),
+           .after = metatranscriptome)
+
+
+
+
+mag245_rRpkm = rpkmRnaTwo |>
+  filter(mag_name == 'MAG_245',
+         !contig %in% contigsToMask) |>
+  mutate(contig = contig |>
+           str_replace('MAG_\\d+_(\\d+)', '\\1'),
+         contig = as.integer(contig),
+         contig_group = if_else(contig == 32, 'plasmid', 'genome')) |>
+  relocate(contig_group, .after = contig) |>
+  pivot_longer(
+    cols = matches('*_RPKM|*_readCounts'),
+    names_to = 'mapping_col',
+    values_to = 'value') |>
+  separate(mapping_col,
+           into = c('metatranscriptome', 'mapping_col'),
+           sep = '_') |>
+  pivot_wider(
+    names_from = mapping_col,
+    values_from = value) |>
+  mutate(RPKM = if_else(readCounts > 15, RPKM, 0)) |>
+  select(-readCounts) |>
+  group_by(mag_name, contig_group, metatranscriptome) |>
+  summarize(RPKM_mean = mean(RPKM),
+            RPKM_max = max(RPKM),
+            .groups = 'drop') |>
+  mutate(across(.cols = 4:5, ~ round(.x, digits = 5))) |>
+  unite(col = 'temp', c(RPKM_mean, RPKM_max), sep = ';') |>
+  pivot_wider(names_from = contig_group, values_from = temp) |>
+  separate(genome,
+           into = c('genome_RPKM_mean', 'genome_RPKM_max'),
+           sep = ';') |>
+  mutate(plasmid = plasmid |> str_replace('(.*);.*', '\\1')) |>
+  rename(plasmid_contig_RPKM = plasmid) |>
+  mutate(across(.cols = 3:5, ~ as.double(.x))) |>
+  arrange(desc(plasmid_contig_RPKM), desc(genome_RPKM_mean))
+
+
+
+# mag18_dRpkm |>
+#   write_tsv('~/Documents/cariaco_mobile_elements_analysis/plasmid_files/mag18_dnaRpkm.tsv')
+# mag245_dRpkm |>
+#   write_tsv('~/Documents/cariaco_mobile_elements_analysis/plasmid_files/mag245_dnaRpkm.tsv')
+# 
+# mag18_rRpkm |> write_tsv('~/Documents/cariaco_mobile_elements_analysis/plasmid_files/mag18_rnaRpkm.tsv')
+# mag245_rRpkm |> write_tsv('~/Documents/cariaco_mobile_elements_analysis/plasmid_files/mag245_rnaRpkm.tsv')
+
+```
+
+<br>
+
+## Process bedGraph files and format the coverage results
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+
+# done on poseidon compute node
+
+#set parallel processing params
+plan(multicore, workers = 30)
+options(future.globals.maxSize = 6081740800)
+
+### dna
+setwd('/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/dna_genomecovs')
+genomeBedframeFiles = system('find . -maxdepth 1 -name "*.tsv" ! -empty',
+                              intern = TRUE)
+
+metaG_names = genomeBedframeFiles |> str_replace('\\.\\/(.*)_genome.*', '\\1')
+
+
+cov_plot_data = function(file, magName) {
+  data = file |>
+    read_tsv(show_col_types = FALSE, progress = FALSE,
+             col_names = c('contig', 'start', 'end', 'coverage_depth')) |>
+    mutate(mag_name = contig |>
+             str_replace('(MAG_\\d+)_.*', '\\1'),
+           .before = 1) |>
+    filter(mag_name %in% magName) |>
+    mutate(position = map2(start, end, ~ seq(.x, .y, by = 1))) |>
+    select(-c(start, end)) |>
+    unnest(position) |>
+    group_by(contig) |>
+    add_tally(name = 'n_bases') |>
+    ungroup() |>
+    mutate(contig_num = contig |>
+             str_replace('MAG_\\d+_(\\d+)', '\\1'),
+           contig_num = as.integer(contig_num)) |>
+    arrange(contig_num) |>
+    select(-contig_num)
+
+  # the number from cumsum() for the previous contig must be added to the
+  # proceeding contig; e.g., cumsum() for contig 1 must be added to
+  # positional values of contig 2; 0 is added to values for contig 1
+  genome_position_metadata = data |>
+    select(contig, n_bases) |>
+    distinct() |>
+    mutate(absContigStart = cumsum(n_bases),
+           absContigStart = c(0, absContigStart[-length(absContigStart)])) |>
+    select(-n_bases)
+
+  data = data |>
+    rename(relPosition = position) |>
+    select(-n_bases) |>
+    left_join(genome_position_metadata, by = 'contig') |>
+    mutate(absPosition = relPosition + absContigStart, .before = relPosition)
+
+  return(list(
+    data = data,
+    metadata = genome_position_metadata
+  ))
+}
+
+covPlotDnaDataMag18 = future_map(genomeBedframeFiles, ~ cov_plot_data(.x, magName = 'MAG_18'))
+covPlotDnaDataMag18 = set_names(covPlotDnaDataMag18, nm = metaG_names)
+
+covPlotDnaDataMag245 = future_map(genomeBedframeFiles, ~ cov_plot_data(.x, magName = 'MAG_245'))
+covPlotDnaDataMag245 = set_names(covPlotDnaDataMag245, nm = metaG_names)
+
+# saveRDS(covPlotDnaDataMag18, file = '/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/rdata_dna_genomecovs/covPlotDnaDataMag18.rds')
+
+# saveRDS(covPlotDnaDataMag245, file = '/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/rdata_dna_genomecovs/covPlotDnaDataMag245.rds')
+
+
+### rna
+setwd('/vortexfs1/omics/pachiadaki/dgellrmermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rna_genomecovs')
+genomeBedframeFiles = system('find . -maxdepth 1 -name "*.tsv" ! -empty',
+                             intern = TRUE)
+
+metaT_names = genomeBedframeFiles |> str_replace('\\.\\/(.*)_genome.*', '\\1')
+
+
+cov_plot_data = function(file, magName) {
+  data = file |>
+    read_tsv(show_col_types = FALSE, progress = FALSE,
+             col_names = c('contig', 'start', 'end', 'coverage_depth')) |>
+    mutate(mag_name = contig |>
+             str_replace('(MAG_\\d+)_.*', '\\1'),
+           .before = 1) |>
+    filter(mag_name %in% magName) |>
+    mutate(position = map2(start, end, ~ seq(.x, .y, by = 1))) |>
+    select(-c(start, end)) |>
+    unnest(position) |>
+    group_by(contig) |>
+    add_tally(name = 'n_bases') |>
+    ungroup() |>
+    mutate(contig_num = contig |>
+             str_replace('MAG_\\d+_(\\d+)', '\\1'),
+           contig_num = as.integer(contig_num)) |>
+    arrange(contig_num) |>
+    select(-contig_num)
+
+  # the number from cumsum() for the previous contig must be added to the
+  # proceeding contig; e.g., cumsum() for contig 1 must be added to
+  # positional values of contig 2; 0 is added to values for contig 1
+  genome_position_metadata = data |>
+    select(contig, n_bases) |>
+    distinct() |>
+    mutate(absContigStart = cumsum(n_bases),
+           absContigStart = c(0, absContigStart[-length(absContigStart)])) |>
+    select(-n_bases)
+
+  data = data |>
+    rename(relPosition = position) |>
+    select(-n_bases) |>
+    left_join(genome_position_metadata, by = 'contig') |>
+    mutate(absPosition = relPosition + absContigStart, .before = relPosition)
+
+  return(list(
+    data = data,
+    metadata = genome_position_metadata
+  ))
+}
+
+
+covPlotRnaDataMag18 = future_map(genomeBedframeFiles, ~ cov_plot_data(.x, magName = 'MAG_18'))
+covPlotRnaDataMag18 = set_names(covPlotRnaDataMag18, nm = metaT_names)
+
+covPlotRnaDataMag245 = future_map(genomeBedframeFiles, ~ cov_plot_data(.x, magName = 'MAG_245'))
+covPlotRnaDataMag245 = set_names(covPlotRnaDataMag245, nm = metaT_names)
+
+
+#saveRDS(covPlotRnaDataMag18, file = '/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rdata_rna_genomecovs/covPlotRnaDataMag18.rds')
+
+#saveRDS(covPlotRnaDataMag245, file = '/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rdata_rna_genomecovs/covPlotRnaDataMag245.rds')
+
+```
+
+<br>
+
+## Plot the coverage results
+
+```{r message=FALSE, warning=FALSE}
+# done locally
+
+covPlotDnaDataMag18 = readRDS('~/Downloads/covPlotDnaDataMag18.rds')
+covPlotDnaDataMag245 = readRDS('~/Downloads/covPlotDnaDataMag245.rds')
+
+cov_plot = function(covPlotData, plot_title = NA) {
+  plot = covPlotData |>
+    mutate(contig_group = case_when(contig == 'MAG_18_14' ~ 'plasmid',
+                                    contig == 'MAG_245_32' ~ 'plasmid',
+                                    TRUE ~ 'genome'),
+           coverage_depth = if_else(contig %in% contigsToMask, 0, coverage_depth)) |>
+    ggplot(aes(
+      x = absPosition,
+      y = coverage_depth,
+      color = contig_group)) +
+    geom_density(stat = 'identity') +
+    theme_bw() +
+    labs(title = plot_title,
+         y = 'Coverage\n',
+         x = '\nGenome position',
+         color = 'Contig type') +
+    theme(panel.background = element_blank())
+
+  return(plot)
+}
+
+### DNA
+
+
+# MAG_18
+
+dnaCovPlotsMag18 = imap(covPlotDnaDataMag18, ~
+                          cov_plot(.x$data, plot_title = .y))
+
+dnaCovPlotsMag18 = dnaCovPlotsMag18[mag18_dRpkm |>
+                                      filter(plasmid_contig_RPKM > 0) |>
+                                      pull(metagenome)]
+
+dnaCovPlotsMag18 = dnaCovPlotsMag18[tibble(x = names(dnaCovPlotsMag18)) |>
+                                      mutate(y = x |> str_replace('.*(\\d{3}).*', '\\1'),
+                                             y = as.integer(y)) |>
+                                      arrange(y) |>
+                                      pull(x)]
+
+# the metagenomes that MAG_18's plasmid was detected in
+dnaCovPlotsMag18 = plot_grid(
+  dnaCovPlotsMag18$D2a267A,
+  dnaCovPlotsMag18$D3a314A,
+  dnaCovPlotsMag18$D3b314A,
+  dnaCovPlotsMag18$D1b900AM,
+  dnaCovPlotsMag18$D3a900AM,
+  dnaCovPlotsMag18$D2a900AN,
+  dnaCovPlotsMag18$D2b900AN,
+  dnaCovPlotsMag18$D2a900BN)
+
+# pdf(file = '~/Downloads/mag18_dnaCovPlots.pdf',
+#     width = 20,
+#     height = 20)
+# dnaCovPlotsMag18
+# dev.off()
+
+
+
+
+### MAG_245
+
+dnaCovPlotsMag245 = imap(covPlotDnaDataMag245, ~
+                          cov_plot(.x$data, plot_title = .y))
+
+dnaCovPlotsMag245 = dnaCovPlotsMag245[mag245_dRpkm |>
+                                      filter(plasmid_contig_RPKM > 0) |>
+                                      pull(metagenome)]
+
+dnaCovPlotsMag245 = dnaCovPlotsMag245[tibble(x = names(dnaCovPlotsMag245)) |>
+                                      mutate(y = x |> str_replace('.*(\\d{3}).*', '\\1'),
+                                             y = as.integer(y)) |>
+                                      arrange(y) |>
+                                      pull(x)]
+
+names(dnaCovPlotsMag245)
+
+# the metagenomes that MAG_18's plasmid was detected in
+dnaCovPlotsMag245 = plot_grid(
+  dnaCovPlotsMag245$D2b237A,
+  dnaCovPlotsMag245$D2b247A,
+  dnaCovPlotsMag245$D2a267A,
+  dnaCovPlotsMag245$D3a295A,
+  dnaCovPlotsMag245$D3a314A,
+  dnaCovPlotsMag245$D3b314A,
+  dnaCovPlotsMag245$D3a900AM,
+  dnaCovPlotsMag245$D1b900AM,
+  dnaCovPlotsMag245$D2b900AN,
+  dnaCovPlotsMag245$D2a900AN,
+  dnaCovPlotsMag245$D1b900BM)
+
+# pdf(file = '~/Downloads/mag245_dnaCovPlots.pdf',
+#     width = 20,
+#     height = 20)
+# dnaCovPlotsMag245
+# dev.off()
+
+
+
+### RNA
+
+
+## MAG_18
+
+covPlotRnaDataMag18 = readRDS('~/Downloads/covPlotRnaDataMag18.rds')
+
+
+rnaCovPlotsMag18 = imap(covPlotRnaDataMag18, ~
+                           cov_plot(.x$data, plot_title = .y))
+
+rnaCovPlotsMag18 = rnaCovPlotsMag18[mag18_rRpkm |>
+                                        filter(plasmid_contig_RPKM > 0) |>
+                                        pull(metatranscriptome)]
+
+rnaCovPlotsMag18 = rnaCovPlotsMag18[tibble(x = names(rnaCovPlotsMag18)) |>
+                                        mutate(y = x |> str_replace('.*(\\d{3}).*', '\\1'),
+                                               y = as.integer(y)) |>
+                                        arrange(y) |>
+                                        pull(x)]
+
+names(rnaCovPlotsMag18)
+
+# the metagenomes that MAG_18's plasmid was detected in
+rnaCovPlotsMag18 = plot_grid(
+  rnaCovPlotsMag18$R2b148A,
+  rnaCovPlotsMag18$R2a148A,
+  rnaCovPlotsMag18$R2a200A,
+  rnaCovPlotsMag18$R2a900AM,
+  rnaCovPlotsMag18$R2b900A)
+
+# pdf(file = '~/Downloads/mag18_rnaCovPlots.pdf',
+#     width = 20,
+#     height = 20)
+# rnaCovPlotsMag18
+# dev.off()
+# rm(covPlotRnaDataMag18)
+
+
+## MAG_245
+
+
+# covPlotRnaDataMag245 = readRDS('/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rdata_rna_genomecovs/covPlotRnaDataMag245.rds')
+# 
+# contigsToMask = readRDS('/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rdata_rna_genomecovs/contigsToMask.rds')
+# 
+# mag245_rRpkm = readRDS('/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rdata_rna_genomecovs/mag245_rRpkm.rds')
+
+
+#
+covPlotRnaDataMag245 = readRDS('~/Downloads/covPlotRnaDataMag245.rds')
+
+
+rnaCovPlotsMag245 = imap(covPlotRnaDataMag245, ~
+                          cov_plot(.x$data, plot_title = .y))
+
+rnaCovPlotsMag245 = rnaCovPlotsMag245[mag245_rRpkm |>
+                                      filter(plasmid_contig_RPKM > 0) |>
+                                      pull(metatranscriptome)]
+
+rnaCovPlotsMag245 = rnaCovPlotsMag245[tibble(x = names(rnaCovPlotsMag245)) |>
+                                      mutate(y = x |> str_replace('.*(\\d{3}).*', '\\1'),
+                                             y = as.integer(y)) |>
+                                      arrange(y) |>
+                                      pull(x)]
+
+names(rnaCovPlotsMag245)
+#saveRDS(rnaCovPlotsMag245, file = '/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rdata_rna_genomecovs/rnaCovPlotsMag245.rds')
+
+# locally done
+
+rnaCovPlotsMag245 = readRDS('~/Downloads/rnaCovPlotsMag245.rds')
+
+rnaCovPlotsMag245
+
+
+# pdf(file = '~/Downloads/mag245_rnaCovPlots.pdf',
+#     width = 20,
+#     height = 20)
+# rnaCovPlotsMag245$R2a900AM
+# dev.off()
+
+```
+
+<br>
+
+## Predict plasmids in Cariaco MAGs with PlasClass
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=plasclass # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=36 # Run on one CPU
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=180gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/nov_18_2022_plasclass_plasmid_detection_array_%A-%a.log# Standard output/error
+#SBATCH --array=0-567
+#SBATCH --qos=scavenger
+
+source activate plasclass
+
+cd /vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-draft-mags
+
+FILE_PATTERN=("1002" "1003" "1007" "1010" "1014" "1015" "1016" "1019" "101" "1023" "1024" "102" "1033" "1036" "1037" "1039" "103" "1042" "1050" "1053" "1056" "1057" "1067" "106" "1071" "1075" "1079" "1080" "1083" "1089" "1092" "1098" "1099" "109" "1100" "1101" "1105" "1108" "1109" "110" "1113" "1116" "1117" "1121" "1123" "112" "1130" "1131" "1146" "1148" "1149" "114" "1151" "1155" "115" "1162" "1167" "116" "1170" "1171" "1173" "1178" "1179" "117" "1183" "1188" "1190" "1194" "1199" "1201" "1208" "120" "1214" "1215" "1219" "121" "1220" "1221" "1224" "1225" "1226" "122" "1239" "1242" "1243" "1244" "1246" "1249" "1250" "1251" "1252" "1253" "1254" "1261" "1262" "1263" "1264" "1268" "1270" "1271" "1274" "1276" "1279" "1283" "1284" "1285" "1286" "1288" "1289" "128" "1290" "1299" "1301" "1302" "1305" "1312" "1316" "1320" "1322" "1334" "1350" "1352" "1353" "1356" "1359" "1363" "1365" "1366" "1367" "1369" "1371" "1372" "1374" "1375" "1384" "1388" "1389" "1392" "1394" "1396" "1398" "13" "1400" "1408" "1413" "1414" "1415" "1419" "1421" "1422" "1423" "1424" "1425" "1428" "1429" "1431" "1432" "1433" "1437" "1438" "1441" "1446" "1447" "1454" "1463" "1464" "1465" "1469" "1478" "147" "1499" "14" "1502" "1503" "1504" "1506" "1507" "1508" "1509" "1510" "1512" "1515" "1518" "151" "1521" "1524" "1526" "1527" "1528" "1531" "1534" "1535" "1536" "1538" "153" "1540" "1542" "1543" "1544" "1548" "1549" "154" "1551" "1552" "1554" "1556" "1559" "1562" "1564" "1566" "1569" "1570" "1576" "1578" "1579" "1583" "1584" "1588" "1593" "1594" "15" "1600" "1601" "1604" "1605" "1606" "1607" "1610" "1618" "1620" "1627" "1628" "1630" "1636" "1638" "163" "1647" "1649" "164" "1650" "1655" "1679" "1681" "1684" "16" "171" "180" "181" "183" "186" "187" "189" "18" "190" "193" "196" "198" "200" "205" "206" "207" "209" "20" "211" "213" "214" "215" "216" "218" "21" "220" "224" "226" "22" "236" "239" "242" "243" "244" "245" "24" "254" "259" "262" "265" "268" "275" "27" "281" "289" "28" "291" "292" "293" "2" "301" "302" "304" "30" "310" "313" "314" "315" "316" "317" "31" "329" "32" "330" "331" "334" "335" "336" "341" "343" "347" "349" "34" "352" "358" "361" "375" "379" "382" "386" "38" "395" "3" "400" "403" "406" "418" "419" "420" "421" "422" "423" "428" "42" "430" "435" "43" "451" "453" "459" "45" "463" "464" "46" "470" "479" "47" "481" "485" "486" "48" "490" "492" "495" "499" "49" "501" "503" "504" "507" "512" "516" "51" "522" "524" "529" "530" "535" "538" "539" "541" "544" "545" "547" "548" "552" "554" "557" "560" "561" "563" "564" "567" "568" "572" "573" "583" "586" "589" "591" "595" "596" "598" "599" "59" "601" "603" "604" "606" "608" "610" "611" "613" "614" "616" "620" "621" "623" "628" "629" "62" "631" "633" "636" "638" "63" "645" "646" "648" "650" "651" "652" "654" "656" "657" "658" "660" "661" "662" "663" "669" "670" "671" "672" "685" "688" "68" "690" "691" "692" "697" "699" "704" "707" "712" "713" "715" "718" "719" "721" "722" "723" "724" "728" "729" "732" "737" "739" "740" "741" "742" "743" "748" "750" "751" "753" "754" "755" "756" "757" "758" "762" "768" "769" "76" "770" "771" "772" "773" "774" "775" "777" "779" "781" "782" "785" "786" "78" "790" "791" "798" "803" "804" "809" "810" "811" "815" "81" "820" "824" "826" "828" "832" "83" "841" "846" "853" "854" "857" "861" "862" "864" "867" "868" "86" "872" "877" "879" "880" "885" "888" "890" "893" "895" "907" "908" "912" "914" "916" "919" "920" "921" "923" "925" "927" "929" "931" "933" "937" "938" "941" "942" "944" "945" "946" "94" "952" "954" "955" "956" "957" "959" "970" "971" "972" "974" "975" "979" "982" "983" "996" "997" "99")
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+PLASCLASS=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-work-051121/PlasClass")
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/plasclass_predictions")
+
+
+python "$PLASCLASS"/classify_fasta.py \
+-f CarAnox_mtb2_"$FILE_PATTERN".fa \
+-o "$OUT_DIR"/MAG_"$FILE_PATTERN".probs.out \
+-p 36
+```
+
+<br>
+
+## Predict plasmids in Cariaco MAGs with PlasFlow
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=plasflow # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=36 # Run on one CPU
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=180gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/nov_20_2022_plasflow_plasmid_detection_array_%A-%a.log# Standard output/error
+#SBATCH --array=0-567
+#SBATCH --qos=scavenger
+
+source activate plasflow
+
+cd /vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/plasflow_predictions
+
+FILE_PATTERN=("1002" "1003" "1007" "1010" "1014" "1015" "1016" "1019" "101" "1023" "1024" "102" "1033" "1036" "1037" "1039" "103" "1042" "1050" "1053" "1056" "1057" "1067" "106" "1071" "1075" "1079" "1080" "1083" "1089" "1092" "1098" "1099" "109" "1100" "1101" "1105" "1108" "1109" "110" "1113" "1116" "1117" "1121" "1123" "112" "1130" "1131" "1146" "1148" "1149" "114" "1151" "1155" "115" "1162" "1167" "116" "1170" "1171" "1173" "1178" "1179" "117" "1183" "1188" "1190" "1194" "1199" "1201" "1208" "120" "1214" "1215" "1219" "121" "1220" "1221" "1224" "1225" "1226" "122" "1239" "1242" "1243" "1244" "1246" "1249" "1250" "1251" "1252" "1253" "1254" "1261" "1262" "1263" "1264" "1268" "1270" "1271" "1274" "1276" "1279" "1283" "1284" "1285" "1286" "1288" "1289" "128" "1290" "1299" "1301" "1302" "1305" "1312" "1316" "1320" "1322" "1334" "1350" "1352" "1353" "1356" "1359" "1363" "1365" "1366" "1367" "1369" "1371" "1372" "1374" "1375" "1384" "1388" "1389" "1392" "1394" "1396" "1398" "13" "1400" "1408" "1413" "1414" "1415" "1419" "1421" "1422" "1423" "1424" "1425" "1428" "1429" "1431" "1432" "1433" "1437" "1438" "1441" "1446" "1447" "1454" "1463" "1464" "1465" "1469" "1478" "147" "1499" "14" "1502" "1503" "1504" "1506" "1507" "1508" "1509" "1510" "1512" "1515" "1518" "151" "1521" "1524" "1526" "1527" "1528" "1531" "1534" "1535" "1536" "1538" "153" "1540" "1542" "1543" "1544" "1548" "1549" "154" "1551" "1552" "1554" "1556" "1559" "1562" "1564" "1566" "1569" "1570" "1576" "1578" "1579" "1583" "1584" "1588" "1593" "1594" "15" "1600" "1601" "1604" "1605" "1606" "1607" "1610" "1618" "1620" "1627" "1628" "1630" "1636" "1638" "163" "1647" "1649" "164" "1650" "1655" "1679" "1681" "1684" "16" "171" "180" "181" "183" "186" "187" "189" "18" "190" "193" "196" "198" "200" "205" "206" "207" "209" "20" "211" "213" "214" "215" "216" "218" "21" "220" "224" "226" "22" "236" "239" "242" "243" "244" "245" "24" "254" "259" "262" "265" "268" "275" "27" "281" "289" "28" "291" "292" "293" "2" "301" "302" "304" "30" "310" "313" "314" "315" "316" "317" "31" "329" "32" "330" "331" "334" "335" "336" "341" "343" "347" "349" "34" "352" "358" "361" "375" "379" "382" "386" "38" "395" "3" "400" "403" "406" "418" "419" "420" "421" "422" "423" "428" "42" "430" "435" "43" "451" "453" "459" "45" "463" "464" "46" "470" "479" "47" "481" "485" "486" "48" "490" "492" "495" "499" "49" "501" "503" "504" "507" "512" "516" "51" "522" "524" "529" "530" "535" "538" "539" "541" "544" "545" "547" "548" "552" "554" "557" "560" "561" "563" "564" "567" "568" "572" "573" "583" "586" "589" "591" "595" "596" "598" "599" "59" "601" "603" "604" "606" "608" "610" "611" "613" "614" "616" "620" "621" "623" "628" "629" "62" "631" "633" "636" "638" "63" "645" "646" "648" "650" "651" "652" "654" "656" "657" "658" "660" "661" "662" "663" "669" "670" "671" "672" "685" "688" "68" "690" "691" "692" "697" "699" "704" "707" "712" "713" "715" "718" "719" "721" "722" "723" "724" "728" "729" "732" "737" "739" "740" "741" "742" "743" "748" "750" "751" "753" "754" "755" "756" "757" "758" "762" "768" "769" "76" "770" "771" "772" "773" "774" "775" "777" "779" "781" "782" "785" "786" "78" "790" "791" "798" "803" "804" "809" "810" "811" "815" "81" "820" "824" "826" "828" "832" "83" "841" "846" "853" "854" "857" "861" "862" "864" "867" "868" "86" "872" "877" "879" "880" "885" "888" "890" "893" "895" "907" "908" "912" "914" "916" "919" "920" "921" "923" "925" "927" "929" "931" "933" "937" "938" "941" "942" "944" "945" "946" "94" "952" "954" "955" "956" "957" "959" "970" "971" "972" "974" "975" "979" "982" "983" "996" "997" "99")
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+PLASFLOW=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-work-051121/PlasFlow")
+
+IN_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-draft-mags")
+
+FILTERED_FASTA_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/plasflow_predictions/filtered_cariaco_mag_fasta_files")
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/plasflow_predictions")
+
+
+perl "$PLASFLOW"/filter_sequences_by_length.pl \
+-input "$IN_DIR"/CarAnox_mtb2_"$FILE_PATTERN".fa \
+-output "$FILTERED_FASTA_DIR"/filt_CarAnox_mtb2_"$FILE_PATTERN".fa \
+-thresh sequence_length_threshold
+
+
+PlasFlow.py \
+--input "$FILTERED_FASTA_DIR"/filt_CarAnox_mtb2_"$FILE_PATTERN".fa \
+--output "$OUT_DIR"/MAG__"$FILE_PATTERN".tsv \
+--threshold 0.7
+```
+
+<br>
+
+## Annotate two predicted plasmids using BlastP
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=blast_nr # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=35 # Run on ten CPUs
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=180gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/two_cariaco_plasmids_blastx_vs_NR_array_%A-%a.log # Standard output/error
+#SBATCH --array=0-1
+
+cd /vortexfs1/omics/edgcomb/home_vedgcomb/Beaudoin/IODP_385/transcriptomes
+
+module load bio
+module load blast/2.7.1
+
+FILE_PATTERN=("MAG_18_14_formatted.faa.txt" "MAG_245_32_formatted.faa.txt")
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+IN_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/plasmid_faa")
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/blastx_results_plasmid")
+
+blastp \
+-query "$IN_DIR"/"$FILE_PATTERN" \
+-db nr \
+-evalue 1e0 \
+-num_threads 35 \
+-max_target_seqs 1 \
+-outfmt "6 qseqid salltitles pident length mismatch gapopen qstart qend sstart send evalue bitscore" \
+-out "$OUT_DIR"/"$FILE_PATTERN"_blastx_results.txt
+
+```
+
+<br>
+
+## Map metagenomic reads to Cariaco MAG contigs
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=coverM_d # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/may_30_2023_coverm_metaG_mapping_cariaco_MAG_contigs_array_%A-%a.log# Standard output/error
+#SBATCH --array=0-47
+#SBATCH --qos=scavenger
+
+source activate coverm
+
+# create minimap2 index
+# cd /vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-draft-mags-dl-for-osf/all_mag_contigs_concat_ref
+# minimap2 -d all_cariaco_mag_contigs.mmi all_cariaco_mag_contigs.fna
+
+
+ALL_CONTIGS_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-draft-mags-dl-for-osf/all_mag_contigs_concat_ref")
+
+
+IN_DIR=$(echo "/vortexfs1/omics/pachiadaki/Cariaco-data/Metagenomes")
+
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna")
+
+OUT_BAM_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/dna_bams")
+
+
+FILE_PATTERN=("D1b900AM" "D1b900BM" "D2a143A" "D2a143B" "D2a200A" "D2a200B" "D2a237A" "D2a237B" "D2a247A" "D2a247B" "D2a267A" "D2a267B" "D2a900AN" "D2a900BN" "D2b143A" "D2b143B" "D2b200A" "D2b200B" "D2b237A" "D2b237B" "D2b247A" "D2b247B" "D2b267A" "D2b267B" "D2b900AN" "D2b900BN" "D3a103A" "D3a103B" "D3a198A" "D3a198B" "D3a234A" "D3a234B" "D3a295A" "D3a295B" "D3a314A" "D3a314B" "D3a900AM" "D3a900BM" "D3b103A" "D3b103B" "D3b198A" "D3b198B" "D3b234A" "D3b234B" "D3b295A" "D3b295B" "D3b314A" "D3b314B")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+coverm contig \
+--coupled "$IN_DIR"/"$FILE_PATTERN"_R1_paired.fastq.gz "$IN_DIR"/"$FILE_PATTERN"_R2_paired.fastq.gz \
+--reference "$ALL_CONTIGS_DIR"/all_cariaco_mag_contigs.fna \
+--mapper minimap2-sr \
+--methods tpm rpkm count \
+--min-read-percent-identity 95 \
+--min-read-aligned-percent 50 \
+--exclude-supplementary \
+--threads 5 \
+--output-file "$OUT_DIR"/"$FILE_PATTERN"_metaG_minimap2_all_contigs_mapping_notCov.tsv \
+--bam-file-cache-directory "$OUT_BAM_DIR" \
+--discard-unmapped
+```
+
+<br>
+
+## Map metatranscriptomic reads to Cariaco MAG contigs
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=coverM_r # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/may_30_2023_coverm_metaT_mapping_cariaco_MAG_contigs_array_%A-%a.log# Standard output/error
+#SBATCH --array=0-47
+#SBATCH --qos=scavenger
+
+source activate coverm
+
+# create minimap2 index
+# cd /vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-draft-mags-dl-for-osf/all_mag_contigs_concat_ref
+# minimap2 -d all_cariaco_mag_contigs.mmi all_cariaco_mag_contigs.fna
+
+
+ALL_CONTIGS_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/cariaco-draft-mags-dl-for-osf/all_mag_contigs_concat_ref")
+
+
+IN_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/Metatranscriptomes/Paired")
+
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna")
+
+OUT_BAM_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rna_bams")
+
+
+FILE_PATTERN=("R2a103A" "R2a103B" "R2a148A" "R2a148B" "R2a198A" "R2a198B" "R2a200A" "R2a200B" "R2a234A" "R2a234B" "R2a237A" "R2a237B" "R2a247A" "R2a247B" "R2a267A" "R2a267B" "R2a295A" "R2a295B" "R2a314A" "R2a314B" "R2a900AM" "R2a900AN" "R2a900BM" "R2a900BN" "R2b148A" "R2b148B" "R2b198A" "R2b198B" "R2b200A" "R2b200B" "R2b237A" "R2b237B" "R2b247A" "R2b247B" "R2b267A" "R2b267B" "R2b295A" "R2b295B" "R2b314A" "R2b314B" "R2b900AN" "R2b900A" "R2b900BN" "R2b900B" "R3b103A" "R3b103B")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+coverm contig \
+--coupled "$IN_DIR"/"$FILE_PATTERN"_R1_paired.fastq.gz "$IN_DIR"/"$FILE_PATTERN"_R2_paired.fastq.gz \
+--reference "$ALL_CONTIGS_DIR"/all_cariaco_mag_contigs.fna \
+--mapper minimap2-sr \
+--methods tpm rpkm count \
+--min-read-percent-identity 95 \
+--min-read-aligned-percent 50 \
+--exclude-supplementary \
+--threads 5 \
+--output-file "$OUT_DIR"/"$FILE_PATTERN"_metaT_minimap2_all_contigs_mapping_notCov.tsv \
+--bam-file-cache-directory "$OUT_BAM_DIR" \
+--discard-unmapped
+```
+
+<br>
+
+## Filter and sort metagenomic read mapping bam files
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=compute # Queue selection
+#SBATCH --job-name=coverM_d # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/june_6_2023_coverm_dna_filter_bam_files_%A-%a.log# Standard output/error
+#SBATCH --array=0-47
+#SBATCH --qos=unlim
+
+source activate coverm
+
+
+FILE_PATTERN=("D1b900AM" "D1b900BM" "D2a143A" "D2a143B" "D2a200A" "D2a200B" "D2a237A" "D2a237B" "D2a247A" "D2a247B" "D2a267A" "D2a267B" "D2a900AN" "D2a900BN" "D2b143A" "D2b143B" "D2b200A" "D2b200B" "D2b237A" "D2b237B" "D2b247A" "D2b247B" "D2b267A" "D2b267B" "D2b900AN" "D2b900BN" "D3a103A" "D3a103B" "D3a198A" "D3a198B" "D3a234A" "D3a234B" "D3a295A" "D3a295B" "D3a314A" "D3a314B" "D3a900AM" "D3a900BM" "D3b103A" "D3b103B" "D3b198A" "D3b198B" "D3b234A" "D3b234B" "D3b295A" "D3b295B" "D3b314A" "D3b314B")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+cd /vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/dna_bams
+
+# filter our poor/supplementary alignments
+coverm filter \
+-b all_cariaco_mag_contigs.fna."$FILE_PATTERN"_R1_paired.fastq.gz.bam \
+-o "$FILE_PATTERN".filtered.bam \
+--min-read-percent-identity 95 \
+--min-read-aligned-percent 50 \
+--exclude-supplementary \
+--threads 5
+
+
+# sort the filtered bam file
+samtools sort -o "$FILE_PATTERN".filtered.sorted.bam "$FILE_PATTERN".filtered.bam
+```
+
+<br>
+
+## Filter and sort metatranscriptomic read mapping bam files
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=scavenger # Queue selection
+#SBATCH --job-name=coverM_r # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/june_6_2023_coverm_rna_filter_bam_files_%A-%a.log# Standard output/error
+#SBATCH --array=0-45
+#SBATCH --qos=scavenger
+
+source activate coverm
+
+
+FILE_PATTERN=("R2a103A" "R2a103B" "R2a148A" "R2a148B" "R2a198A" "R2a198B" "R2a200A" "R2a200B" "R2a234A" "R2a234B" "R2a237A" "R2a237B" "R2a247A" "R2a247B" "R2a267A" "R2a267B" "R2a295A" "R2a295B" "R2a314A" "R2a314B" "R2a900AM" "R2a900AN" "R2a900BM" "R2a900BN" "R2b148A" "R2b148B" "R2b198A" "R2b198B" "R2b200A" "R2b200B" "R2b237A" "R2b237B" "R2b247A" "R2b247B" "R2b267A" "R2b267B" "R2b295A" "R2b295B" "R2b314A" "R2b314B" "R2b900AN" "R2b900A" "R2b900BN" "R2b900B" "R3b103A" "R3b103B")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+cd /vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rna_bams
+
+# filter our poor/supplementary alignments
+coverm filter \
+-b all_cariaco_mag_contigs.fna."$FILE_PATTERN"_R1_paired.fastq.gz.bam \
+-o "$FILE_PATTERN".filtered.bam \
+--min-read-percent-identity 95 \
+--min-read-aligned-percent 50 \
+--exclude-supplementary \
+--threads 5
+
+
+# sort the filtered bam file
+samtools sort -o "$FILE_PATTERN".filtered.sorted.bam "$FILE_PATTERN".filtered.bam
+```
+
+<br>
+
+## Create bedGraph coverage files from sorted, filtered metagenomic bam files
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=compute # Queue selection
+#SBATCH --job-name=bedtools_d # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/june_6_2023_bedtools_dna_genomecov_%A-%a.log# Standard output/error
+#SBATCH --array=0-47
+#SBATCH --qos=unlim
+
+source activate bedtools
+
+
+FILE_PATTERN=("D1b900AM" "D1b900BM" "D2a143A" "D2a143B" "D2a200A" "D2a200B" "D2a237A" "D2a237B" "D2a247A" "D2a247B" "D2a267A" "D2a267B" "D2a900AN" "D2a900BN" "D2b143A" "D2b143B" "D2b200A" "D2b200B" "D2b237A" "D2b237B" "D2b247A" "D2b247B" "D2b267A" "D2b267B" "D2b900AN" "D2b900BN" "D3a103A" "D3a103B" "D3a198A" "D3a198B" "D3a234A" "D3a234B" "D3a295A" "D3a295B" "D3a314A" "D3a314B" "D3a900AM" "D3a900BM" "D3b103A" "D3b103B" "D3b198A" "D3b198B" "D3b234A" "D3b234B" "D3b295A" "D3b295B" "D3b314A" "D3b314B")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/dna_genomecovs")
+
+
+cd /vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/dna/dna_bams
+
+# create coverage tsv of all contigs in a bam file
+bedtools genomecov -ibam "$FILE_PATTERN".filtered.sorted.bam -bga > "$OUT_DIR"/"$FILE_PATTERN"_genomecov.tsv
+```
+
+<br>
+
+## Create bedGraph coverage files from sorted, filtered metatranscriptomic bam files
+
+```{bash, eval=FALSE, include=TRUE}
+#!/bin/bash
+#SBATCH --partition=compute # Queue selection
+#SBATCH --job-name=bedtools_r # Job name
+#SBATCH --mail-type=ALL # Mail events (BEGIN, END, FAIL, ALL)
+#SBATCH --mail-user=dgellermcgrath@gmail.com # Where to send mail
+#SBATCH --ntasks=5 #
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=30gb # Job memory request
+#SBATCH --time=1-00:00:00 # Time limit hrs:min:sec
+#SBATCH --output=logs/june_6_2023_bedtools_rna_genomecov_%A-%a.log# Standard output/error
+#SBATCH --array=0-45
+#SBATCH --qos=unlim
+
+source activate bedtools
+
+
+FILE_PATTERN=("R2a103A" "R2a103B" "R2a148A" "R2a148B" "R2a198A" "R2a198B" "R2a200A" "R2a200B" "R2a234A" "R2a234B" "R2a237A" "R2a237B" "R2a247A" "R2a247B" "R2a267A" "R2a267B" "R2a295A" "R2a295B" "R2a314A" "R2a314B" "R2a900AM" "R2a900AN" "R2a900BM" "R2a900BN" "R2b148A" "R2b148B" "R2b198A" "R2b198B" "R2b200A" "R2b200B" "R2b237A" "R2b237B" "R2b247A" "R2b247B" "R2b267A" "R2b267B" "R2b295A" "R2b295B" "R2b314A" "R2b314B" "R2b900AN" "R2b900A" "R2b900BN" "R2b900B" "R3b103A" "R3b103B")
+
+
+FILE_PATTERN=${FILE_PATTERN[$SLURM_ARRAY_TASK_ID]}
+
+
+OUT_DIR=$(echo "/vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rna_genomecovs")
+
+cd /vortexfs1/omics/pachiadaki/dgellermcgrath/CARIACO_MOBILE_ELEMENTS_ANALYSIS/plasmids/manuscript_plasmid_data/coverM/rna/rna_bams
+
+# create coverage tsv of all contigs in a bam file
+bedtools genomecov -ibam "$FILE_PATTERN".filtered.sorted.bam -bga > "$OUT_DIR"/"$FILE_PATTERN"_genomecov.tsv
+```
