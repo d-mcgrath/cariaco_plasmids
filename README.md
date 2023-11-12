@@ -1,6 +1,6 @@
 # Cariaco plasmids
 
-[![DOI](https://zenodo.org/badge/509871897.svg)](https://zenodo.org/badge/latestdoi/509871897)
+[![DOI](https://zenodo.org/badge/654643738.svg)](https://zenodo.org/doi/10.5281/zenodo.10115007)
 
 This repository contains scripts, data, and computing environments used for the analysis of plasmids detected in MAGs recovered from the Cariaco Basin, Venezuela for the publication "[INSERT HERE]". The authors of this paper are P. Mara, D. Geller-McGrath, G. Taylor, E. Suter, V. Edgcomb, and M. Pachiadaki. The scripts, files, and data here were written and uploaded by D. Geller-McGrath.
 
